@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Paket-Profi -- Logistik Game</title>
+<style>
+  html,body{margin:0;height:100%;background:#1b2330;color:#eee;font-family:system-ui,sans-serif;overflow:hidden}
+  #hud{position:fixed;top:0;left:0;right:0;padding:10px 16px;display:flex;gap:24px;
+       background:rgba(0,0,0,.55);font-size:18px;z-index:10}
+  #hud b{color:#ffd86b}
+  #msg{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+       background:rgba(0,0,0,.85);padding:24px 32px;border-radius:12px;
+       font-size:22px;text-align:center;display:none;z-index:20}
+  #msg button{margin-top:14px;padding:10px 20px;font-size:18px;cursor:pointer;
+              border:0;border-radius:8px;background:#ffd86b;color:#222;font-weight:bold}
+  canvas{display:block}
+  #help{position:fixed;bottom:8px;left:0;right:0;text-align:center;
+        color:#aaa;font-size:14px}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>Zeit: <b id="time">120</b>s</div>
+  <div>Geld: <b id="money">0</b> EUR</div>
+  <div>Sprit: <b id="fuel">100</b></div>
+  <div>Pakete: <b id="cargo">0</b>/3</div>
+  <div>Level: <b id="level">1</b></div>
+</div>
+<canvas id="c"></canvas>
+<div id="help">Pfeiltasten / WASD = fahren &nbsp;|&nbsp; P = Pause &nbsp;|&nbsp; Lade + tanke beim <span style="color:#7ad">Lager</span>, liefere zu <span style="color:#fb7">Kunden</span></div>
+<div id="msg"><div id="msgText"></div><button onclick="location.reload()">Neu starten</button></div>
+
+<script>
+const cvs=document.getElementById('c'),ctx=cvs.getContext('2d');
+let W,H;function resize(){W=cvs.width=innerWidth;H=cvs.height=innerHeight}
+addEventListener('resize',resize);resize();
+
+const state={
+  truck:{x:0,y:0,a:0,v:0,cargo:0,maxCargo:3,stuckT:0},
+  warehouse:{x:0,y:0,r:55},
+  customers:[],
+  jams:[],
+  traffic:[],
+  money:0, fuel:100, time:120, level:1,
+  done:false, paused:false,
+  highscore: +(localStorage.getItem('paketprofi_hi')||0)
+};
+
+function rand(a,b){return a+Math.random()*(b-a)}
+let _ac=null;
+function beep(freq,dur){
+  try{
+    if(!_ac) _ac=new (window.AudioContext||window.webkitAudioContext)();
+    const o=_ac.createOscillator(), g=_ac.createGain();
+    o.frequency.value=freq; o.type='square';
+    g.gain.value=0.05;
+    o.connect(g); g.connect(_ac.destination);
+    o.start(); o.stop(_ac.currentTime+dur);
+  }catch(e){}
+}
+
+function farFromAll(x,y,minDist,arrs){
+  for(const arr of arrs){
+    for(const o of arr){
+      if(Math.hypot(x-o.x, y-o.y) < minDist) return false;
+    }
+  }
+  return true;
+}
+function newLevel(){
+  state.warehouse.x=120; state.warehouse.y=H/2;
+  state.truck.x=state.warehouse.x; state.truck.y=state.warehouse.y;
+  state.truck.a=0; state.truck.v=0; state.truck.cargo=0; state.truck.stuckT=0;
+  // 1) Kunden zuerst (kollisionsfrei zu Lager + sich selbst)
+  state.customers=[];
+  const n=2+state.level;
+  for(let i=0;i<n;i++){
+    let x,y,tries=0;
+    do { x=rand(280,W-60); y=rand(60,H-60); tries++; }
+    while(tries<60 && (Math.hypot(x-state.warehouse.x,y-state.warehouse.y)<120 ||
+                       !farFromAll(x,y,90,[state.customers])));
+    state.customers.push({x,y,r:35,reward:50+Math.floor(rand(0,40)),done:false});
+  }
+  // 2) Staus -- nicht auf Kunden, nicht auf Lager
+  state.jams=[];
+  const jamCount=2+state.level;
+  for(let i=0;i<jamCount;i++){
+    const horiz=Math.random()<0.5;
+    let jx,jy,tries=0;
+    do { jx=rand(260,W-120); jy=rand(80,H-80); tries++; }
+    while(tries<60 && (Math.hypot(jx-state.warehouse.x,jy-state.warehouse.y)<140 ||
+                       !farFromAll(jx,jy,80,[state.customers,state.jams])));
+    const cars=3+Math.floor(rand(0,3));
+    for(let k=0;k<cars;k++){
+      state.jams.push({
+        x: jx + (horiz? k*34 : 0),
+        y: jy + (horiz? 0 : k*34),
+        w: horiz?30:22, h: horiz?22:30,
+        color: ['#e85','#5be','#fc6','#f88','#9d7'][Math.floor(rand(0,5))]
+      });
+    }
+  }
+  // 3) andere fahrende LKWs -- nicht direkt auf Kunden/Lager spawnen
+  state.traffic=[];
+  const tCount=3+state.level;
+  for(let i=0;i<tCount;i++){
+    const horiz=Math.random()<0.5;
+    const dir=Math.random()<0.5?1:-1;
+    let x,y,tries=0;
+    do { x=rand(280,W-60); y=rand(80,H-60); tries++; }
+    while(tries<60 && (Math.hypot(x-state.warehouse.x,y-state.warehouse.y)<140 ||
+                       !farFromAll(x,y,70,[state.customers])));
+    state.traffic.push({
+      x, y,
+      vx: horiz? dir*rand(60,110):0,
+      vy: horiz? 0: dir*rand(60,110),
+      color: ['#e85','#5be','#fc6','#f88','#9d7','#b9f'][Math.floor(rand(0,6))]
+    });
+  }
+}
+newLevel();
+
+const keys={};
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(k==='p' && !state.done){ state.paused=!state.paused; return; }
+  keys[k]=1;
+});
+addEventListener('keyup',e=>keys[e.key.toLowerCase()]=0);
+
+function step(dt){
+  if(state.done||state.paused)return;
+  const t=state.truck;
+  const up=keys['arrowup']||keys['w'], dn=keys['arrowdown']||keys['s'];
+  const lf=keys['arrowleft']||keys['a'], rt=keys['arrowright']||keys['d'];
+  if(up) t.v += 180*dt;
+  if(dn) t.v -= 140*dt;
+  t.v *= 0.96;
+  if(t.v>260)t.v=260; if(t.v<-160)t.v=-160;
+  const turn=2.4*dt*(t.v/180);
+  if(lf) t.a -= turn||1.6*dt;
+  if(rt) t.a += turn||1.6*dt;
+  // andere LKWs bewegen + an Rändern umdrehen
+  for(const o of state.traffic){
+    o.x += o.vx*dt; o.y += o.vy*dt;
+    if(o.x<40||o.x>W-40) o.vx*=-1;
+    if(o.y<60||o.y>H-40) o.vy*=-1;
+  }
+  const nx = t.x + Math.cos(t.a)*t.v*dt;
+  const ny = t.y + Math.sin(t.a)*t.v*dt;
+  // Stau-Kollision: hart abbremsen, nicht durchfahren
+  let blocked=false;
+  for(const j of state.jams){
+    if(nx > j.x-j.w-18 && nx < j.x+j.w+18 &&
+       ny > j.y-j.h-14 && ny < j.y+j.h+14){
+      blocked=true; break;
+    }
+  }
+  // Kollision mit fahrenden LKWs
+  for(const o of state.traffic){
+    if(nx > o.x-30 && nx < o.x+30 && ny > o.y-20 && ny < o.y+20){
+      blocked=true; break;
+    }
+  }
+  if(blocked){
+    t.v = -t.v*0.3;  // abprallen
+  } else {
+    t.x=nx; t.y=ny;
+  }
+  if(t.x<20)t.x=20; if(t.x>W-20)t.x=W-20;
+  if(t.y<40)t.y=40; if(t.y>H-20)t.y=H-20;
+
+  // fuel
+  state.fuel -= Math.abs(t.v)*dt*0.012;
+  if(state.fuel<0)state.fuel=0;
+
+  // time
+  state.time -= dt;
+  if(state.time<=0||state.fuel<=0){ end("Game Over -- Schicht zu Ende."); return; }
+
+  // warehouse pickup + tanken
+  const w=state.warehouse;
+  if(Math.hypot(t.x-w.x,t.y-w.y)<w.r){
+    if(t.cargo<t.maxCargo) t.cargo=t.maxCargo;
+    state.fuel = Math.min(100, state.fuel + 35*dt);
+  }
+  // stuck-recovery: 2.5s mit v~0 + Kollision -> kleinen Rückwärtsstoss
+  if(blocked && Math.abs(t.v)<8){ t.stuckT += dt; } else { t.stuckT = Math.max(0,t.stuckT-dt); }
+  if(t.stuckT > 2.5){
+    t.v = -120;
+    t.a += (Math.random()-0.5)*0.8;
+    t.stuckT = 0;
+  }
+  // delivery
+  for(const c of state.customers){
+    if(c.done)continue;
+    if(Math.hypot(t.x-c.x,t.y-c.y)<c.r && t.cargo>0){
+      c.done=true; t.cargo--; state.money += c.reward;
+      beep(880,0.12);
+    }
+  }
+  if(state.customers.every(c=>c.done)){
+    state.level++; state.time+=45; state.fuel=Math.min(100,state.fuel+40);
+    newLevel();
+  }
+}
+
+function drawTruck(t){
+  ctx.save();
+  ctx.translate(t.x,t.y); ctx.rotate(t.a);
+  // trailer
+  ctx.fillStyle='#cfd6e2';
+  ctx.fillRect(-30,-12,38,24);
+  ctx.strokeStyle='#222';ctx.strokeRect(-30,-12,38,24);
+  // cab
+  ctx.fillStyle='#ffd86b';
+  ctx.fillRect(8,-10,18,20);
+  ctx.strokeRect(8,-10,18,20);
+  // wheels
+  ctx.fillStyle='#111';
+  ctx.fillRect(-26,-15,8,3); ctx.fillRect(-26,12,8,3);
+  ctx.fillRect(-2,-15,8,3); ctx.fillRect(-2,12,8,3);
+  ctx.fillRect(16,-13,8,3); ctx.fillRect(16,10,8,3);
+  // cargo indicator
+  ctx.fillStyle='#222';ctx.font='bold 12px sans-serif';
+  ctx.fillText(t.cargo,-8,4);
+  ctx.restore();
+}
+
+function draw(){
+  // road background
+  ctx.fillStyle='#243245'; ctx.fillRect(0,0,W,H);
+  // grid streets
+  ctx.strokeStyle='#2d3d55'; ctx.lineWidth=18;
+  for(let x=60;x<W;x+=160){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke()}
+  for(let y=80;y<H;y+=140){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke()}
+  ctx.strokeStyle='#ffd86b55'; ctx.lineWidth=2; ctx.setLineDash([10,14]);
+  for(let x=60;x<W;x+=160){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke()}
+  for(let y=80;y<H;y+=140){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke()}
+  ctx.setLineDash([]);
+
+  // warehouse
+  const w=state.warehouse;
+  ctx.fillStyle='#3b6ea8';
+  ctx.fillRect(w.x-w.r,w.y-w.r,w.r*2,w.r*2);
+  ctx.strokeStyle='#7ad9ff';ctx.lineWidth=3;
+  ctx.strokeRect(w.x-w.r,w.y-w.r,w.r*2,w.r*2);
+  ctx.fillStyle='#fff';ctx.font='bold 14px sans-serif';
+  ctx.textAlign='center';ctx.fillText('LAGER',w.x,w.y+5);
+
+  // customers
+  for(const c of state.customers){
+    ctx.fillStyle=c.done?'#3a5':'#d36b1f';
+    ctx.beginPath();ctx.arc(c.x,c.y,c.r,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+    ctx.fillStyle='#fff';ctx.font='bold 13px sans-serif';
+    ctx.fillText(c.done?'OK':(c.reward+'EUR'),c.x,c.y+5);
+  }
+  ctx.textAlign='start';
+
+  // Staus
+  for(const j of state.jams){
+    ctx.fillStyle=j.color;
+    ctx.fillRect(j.x-j.w/2,j.y-j.h/2,j.w,j.h);
+    ctx.strokeStyle='#111';ctx.lineWidth=1;
+    ctx.strokeRect(j.x-j.w/2,j.y-j.h/2,j.w,j.h);
+  }
+
+  // andere LKWs
+  for(const o of state.traffic){
+    const horiz=Math.abs(o.vx)>Math.abs(o.vy);
+    const w=horiz?42:22, h=horiz?22:42;
+    ctx.fillStyle=o.color;
+    ctx.fillRect(o.x-w/2,o.y-h/2,w,h);
+    ctx.strokeStyle='#111';ctx.strokeRect(o.x-w/2,o.y-h/2,w,h);
+    // Kabine
+    ctx.fillStyle='#333';
+    if(horiz){
+      const cx = o.vx>0 ? o.x+w/2-8 : o.x-w/2;
+      ctx.fillRect(cx,o.y-h/2,8,h);
+    } else {
+      const cy = o.vy>0 ? o.y+h/2-8 : o.y-h/2;
+      ctx.fillRect(o.x-w/2,cy,w,8);
+    }
+  }
+
+  drawTruck(state.truck);
+
+  // Ziel-Pfeil am Bildschirmrand (zeigt nächstes Ziel)
+  const t=state.truck;
+  let tgt=null;
+  if(t.cargo<=0){ tgt=state.warehouse; }
+  else {
+    let bd=1e9;
+    for(const c of state.customers){
+      if(c.done)continue;
+      const d=Math.hypot(t.x-c.x,t.y-c.y);
+      if(d<bd){bd=d; tgt=c;}
+    }
+  }
+  if(tgt){
+    const dx=tgt.x-t.x, dy=tgt.y-t.y;
+    const ang=Math.atan2(dy,dx);
+    const r=Math.min(W,H)*0.32;
+    const ax=t.x+Math.cos(ang)*r, ay=t.y+Math.sin(ang)*r;
+    ctx.save(); ctx.translate(ax,ay); ctx.rotate(ang);
+    ctx.fillStyle=t.cargo<=0?'#7ad9ff':'#ffd86b';
+    ctx.globalAlpha=0.75;
+    ctx.beginPath(); ctx.moveTo(14,0); ctx.lineTo(-10,7); ctx.lineTo(-10,-7); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // Pause-Overlay
+  if(state.paused){
+    ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#ffd86b'; ctx.font='bold 48px sans-serif';
+    ctx.textAlign='center'; ctx.fillText('PAUSE', W/2, H/2);
+    ctx.font='16px sans-serif'; ctx.fillStyle='#fff';
+    ctx.fillText('P druecken zum Fortsetzen', W/2, H/2+30);
+    ctx.textAlign='start';
+  }
+
+  // HUD update
+  time.textContent=Math.max(0,Math.ceil(state.time));
+  money.textContent=state.money;
+  fuel.textContent=Math.ceil(state.fuel);
+  cargo.textContent=state.truck.cargo+'/'+state.truck.maxCargo;
+  level.textContent=state.level;
+}
+
+function end(text){
+  state.done=true;
+  beep(220,0.4);
+  const isNew = state.money > state.highscore;
+  if(isNew){ state.highscore = state.money; localStorage.setItem('paketprofi_hi', state.money); }
+  document.getElementById('msgText').innerHTML=
+    text+'<br><br>Verdient: <b>'+state.money+' EUR</b><br>Level erreicht: <b>'+state.level+'</b>'+
+    '<br>Highscore: <b>'+state.highscore+' EUR</b>'+(isNew?' <span style="color:#ffd86b">NEU!</span>':'');
+  document.getElementById('msg').style.display='block';
+}
+
+let last=performance.now();
+function loop(t){
+  const dt=Math.min(0.05,(t-last)/1000); last=t;
+  step(dt); draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
